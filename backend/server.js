@@ -37,6 +37,54 @@ const requireRole = (...roles) => (req, res, next) => {
   next();
 };
 
+// ---- VALIDATION FUNCTIONS ----
+const validateEmail = (email) => {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+};
+
+const validateName = (name) => {
+  return name && name.length >= 20 && name.length <= 60;
+};
+
+const validateAddress = (address) => {
+  return !address || address.length <= 400;
+};
+
+const validatePassword = (password) => {
+  // 8-16 characters, at least one uppercase letter, at least one special character
+  const passwordRegex = /^(?=.*[A-Z])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,16}$/;
+  return passwordRegex.test(password);
+};
+
+const validateFormData = (name, email, password, address) => {
+  const errors = [];
+  
+  if (!name) {
+    errors.push('Name is required');
+  } else if (!validateName(name)) {
+    errors.push('Name must be between 20 and 60 characters');
+  }
+  
+  if (!email) {
+    errors.push('Email is required');
+  } else if (!validateEmail(email)) {
+    errors.push('Email must be valid');
+  }
+  
+  if (!password) {
+    errors.push('Password is required');
+  } else if (!validatePassword(password)) {
+    errors.push('Password must be 8-16 characters, include at least one uppercase letter and one special character');
+  }
+  
+  if (address && !validateAddress(address)) {
+    errors.push('Address must not exceed 400 characters');
+  }
+  
+  return errors;
+};
+
 // ---- DB SCHEMA INIT (for convenience) ----
 const initDb = async () => {
   await exec(`
@@ -77,6 +125,19 @@ const initDb = async () => {
     );
   `);
 
+  await exec(`
+    CREATE TABLE IF NOT EXISTS owner_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+      reason TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+  `);
+
   // Seed an admin if none exists
   const admin = await get(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`);
   if (!admin) {
@@ -94,9 +155,13 @@ const initDb = async () => {
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { name, email, address, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Missing required fields' });
+    
+    // Validate form data
+    const validationErrors = validateFormData(name, email, password, address);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ message: 'Validation failed', errors: validationErrors });
     }
+    
     const hash = await bcrypt.hash(password, 10);
     const insert = await run(
       `INSERT INTO users (name, email, address, password_hash, role)
@@ -110,6 +175,9 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(201).json(created);
   } catch (err) {
     console.error(err);
+    if (err.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({ message: 'Email already registered' });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -141,6 +209,19 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/change-password', authenticate, async (req, res) => {
   try {
     const { oldPassword, newPassword } = req.body;
+    
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+    
+    // Validate new password
+    if (!validatePassword(newPassword)) {
+      return res.status(400).json({ 
+        message: 'Password validation failed',
+        errors: ['Password must be 8-16 characters, include at least one uppercase letter and one special character']
+      });
+    }
+    
     const user = await get(`SELECT * FROM users WHERE id = ?`, [req.user.id]);
     if (!user) return res.status(404).json({ message: 'User not found' });
     const ok = await bcrypt.compare(oldPassword, user.password_hash);
@@ -175,9 +256,18 @@ app.get('/api/admin/summary', authenticate, requireRole('admin'), async (req, re
 app.post('/api/admin/users', authenticate, requireRole('admin'), async (req, res) => {
   try {
     const { name, email, address, password, role } = req.body;
+    
+    // Validate role
     if (!['admin', 'normal', 'owner'].includes(role)) {
       return res.status(400).json({ message: 'Invalid role' });
     }
+    
+    // Validate form data
+    const validationErrors = validateFormData(name, email, password, address);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ message: 'Validation failed', errors: validationErrors });
+    }
+    
     const hash = await bcrypt.hash(password, 10);
     const insert = await run(
       `INSERT INTO users (name, email, address, password_hash, role)
@@ -191,6 +281,9 @@ app.post('/api/admin/users', authenticate, requireRole('admin'), async (req, res
     res.status(201).json(created);
   } catch (err) {
     console.error(err);
+    if (err.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({ message: 'Email already registered' });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -289,6 +382,183 @@ app.get('/api/admin/stores', authenticate, requireRole('admin'), async (req, res
       params
     );
     res.json(stores);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ---- ADMIN OWNER REQUEST ROUTES ----
+// View all pending owner requests
+app.get('/api/admin/owner-requests', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const requests = await all(
+      `SELECT r.id, r.user_id, u.name, u.email, u.address, r.status, r.reason, r.created_at, r.updated_at
+       FROM owner_requests r
+       JOIN users u ON u.id = r.user_id
+       WHERE r.status = 'pending'
+       ORDER BY r.created_at ASC`,
+      []
+    );
+    res.json(requests);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all owner requests with filter by status
+app.get('/api/admin/owner-requests/all', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const { status } = req.query;
+    const where = status ? 'WHERE r.status = ?' : '';
+    const params = status ? [status] : [];
+    
+    const requests = await all(
+      `SELECT r.id, r.user_id, u.name, u.email, u.address, r.status, r.reason, r.created_at, r.updated_at
+       FROM owner_requests r
+       JOIN users u ON u.id = r.user_id
+       ${where}
+       ORDER BY r.created_at DESC`,
+      params
+    );
+    res.json(requests);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Approve owner request
+app.post('/api/admin/owner-requests/:requestId/approve', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    
+    // Get the request
+    const request = await get(
+      `SELECT * FROM owner_requests WHERE id = ?`,
+      [requestId]
+    );
+    
+    if (!request) {
+      return res.status(404).json({ message: 'Request not found' });
+    }
+    
+    if (request.status !== 'pending') {
+      return res.status(400).json({ message: 'Request is not pending' });
+    }
+    
+    // Update user role to owner
+    await run(
+      `UPDATE users SET role = 'owner' WHERE id = ?`,
+      [request.user_id]
+    );
+    
+    // Update request status to approved
+    await run(
+      `UPDATE owner_requests SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [requestId]
+    );
+    
+    const updatedRequest = await get(
+      `SELECT * FROM owner_requests WHERE id = ?`,
+      [requestId]
+    );
+    
+    res.json({ message: 'Owner request approved', request: updatedRequest });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Reject owner request
+app.post('/api/admin/owner-requests/:requestId/reject', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { reason } = req.body;
+    
+    // Get the request
+    const request = await get(
+      `SELECT * FROM owner_requests WHERE id = ?`,
+      [requestId]
+    );
+    
+    if (!request) {
+      return res.status(404).json({ message: 'Request not found' });
+    }
+    
+    if (request.status !== 'pending') {
+      return res.status(400).json({ message: 'Request is not pending' });
+    }
+    
+    // Update request status to rejected with reason
+    await run(
+      `UPDATE owner_requests SET status = 'rejected', reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [reason || 'Request rejected by admin', requestId]
+    );
+    
+    const updatedRequest = await get(
+      `SELECT * FROM owner_requests WHERE id = ?`,
+      [requestId]
+    );
+    
+    res.json({ message: 'Owner request rejected', request: updatedRequest });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ---- NORMAL USER OWNER REQUEST ROUTES ----
+// Request to become owner
+app.post('/api/user/request-owner', authenticate, requireRole('normal'), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Check if user already has a pending or approved request
+    const existingRequest = await get(
+      `SELECT * FROM owner_requests WHERE user_id = ? AND status IN ('pending', 'approved')`,
+      [userId]
+    );
+    
+    if (existingRequest) {
+      return res.status(400).json({ message: 'You already have a pending or approved owner request' });
+    }
+    
+    // Create new owner request
+    const insert = await run(
+      `INSERT INTO owner_requests (user_id, status) VALUES (?, 'pending')`,
+      [userId]
+    );
+    
+    const request = await get(
+      `SELECT * FROM owner_requests WHERE id = ?`,
+      [insert.id]
+    );
+    
+    res.status(201).json({ message: 'Owner request submitted', request });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get user's owner request status
+app.get('/api/user/owner-request-status', authenticate, requireRole('normal'), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const request = await get(
+      `SELECT * FROM owner_requests WHERE user_id = ?`,
+      [userId]
+    );
+    
+    if (!request) {
+      return res.json({ request: null, message: 'No request found' });
+    }
+    
+    res.json({ request });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });

@@ -12,6 +12,7 @@ function App() {
   );
   const [view, setView] = useState('login'); // 'login' | 'signup' | dashboards
   const [loginRole, setLoginRole] = useState('normal'); // 'normal' | 'admin' | 'owner'
+  const [showChangePassword, setShowChangePassword] = useState(false);
 
   useEffect(() => {
     if (user?.role === 'admin') setView('admin-dashboard');
@@ -46,10 +47,20 @@ function App() {
             <span>
               {user.name} ({user.role})
             </span>
+            <button onClick={() => setShowChangePassword(true)} className="btn-secondary">
+              Change Password
+            </button>
             <button onClick={logout}>Logout</button>
           </div>
         )}
       </header>
+
+      {showChangePassword && (
+        <ChangePasswordModal
+          token={token}
+          onClose={() => setShowChangePassword(false)}
+        />
+      )}
 
       {!user && (
         <div className="auth-toggle">
@@ -306,6 +317,7 @@ function AdminDashboard({ token }) {
     address: '',
     owner_id: '',
   });
+  const [ownerRequests, setOwnerRequests] = useState([]);
   const [error, setError] = useState('');
 
   const authHeaders = {
@@ -347,10 +359,19 @@ function AdminDashboard({ token }) {
     if (res.ok) setStores(data);
   };
 
+  const loadOwnerRequests = async () => {
+    const res = await fetch(`${API_BASE}/admin/owner-requests`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (res.ok) setOwnerRequests(data);
+  };
+
   useEffect(() => {
     loadSummary();
     loadUsers();
     loadStores();
+    loadOwnerRequests();
   }, []);
 
   useEffect(() => {
@@ -423,6 +444,39 @@ function AdminDashboard({ token }) {
       });
       loadStores();
       loadSummary();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const approveOwnerRequest = async (requestId) => {
+    setError('');
+    try {
+      const res = await fetch(`${API_BASE}/admin/owner-requests/${requestId}/approve`, {
+        method: 'POST',
+        headers: authHeaders,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to approve request');
+      loadOwnerRequests();
+      loadUsers();
+      loadSummary();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const rejectOwnerRequest = async (requestId, reason = '') => {
+    setError('');
+    try {
+      const res = await fetch(`${API_BASE}/admin/owner-requests/${requestId}/reject`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ reason }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to reject request');
+      loadOwnerRequests();
     } catch (err) {
       setError(err.message);
     }
@@ -643,6 +697,49 @@ function AdminDashboard({ token }) {
           </tbody>
         </table>
       </section>
+
+      <section className="section">
+        <h3>Owner Requests ({ownerRequests.length} Pending)</h3>
+        {ownerRequests.length === 0 ? (
+          <p className="no-data">No pending owner requests</p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>User Name</th>
+                <th>Email</th>
+                <th>Address</th>
+                <th>Requested</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ownerRequests.map((r) => (
+                <tr key={r.id}>
+                  <td>{r.name}</td>
+                  <td>{r.email}</td>
+                  <td>{r.address}</td>
+                  <td>{new Date(r.created_at).toLocaleDateString()}</td>
+                  <td>
+                    <button
+                      onClick={() => approveOwnerRequest(r.id)}
+                      className="btn-approve"
+                    >
+                      Approve
+                    </button>
+                    <button
+                      onClick={() => rejectOwnerRequest(r.id)}
+                      className="btn-reject"
+                    >
+                      Reject
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
     </div>
   );
 }
@@ -651,6 +748,8 @@ function UserDashboard({ token }) {
   const [stores, setStores] = useState([]);
   const [filters, setFilters] = useState({ name: '', address: '' });
   const [error, setError] = useState('');
+  const [ownerRequestStatus, setOwnerRequestStatus] = useState(null);
+  const [showOwnerModal, setShowOwnerModal] = useState(false);
 
   const loadStores = async () => {
     const params = new URLSearchParams(
@@ -667,8 +766,23 @@ function UserDashboard({ token }) {
     }
   };
 
+  const loadOwnerRequestStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/user/owner-request-status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok && data.request) {
+        setOwnerRequestStatus(data.request);
+      }
+    } catch (err) {
+      // Silent fail
+    }
+  };
+
   useEffect(() => {
     loadStores();
+    loadOwnerRequestStatus();
   }, []);
 
   useEffect(() => {
@@ -697,6 +811,41 @@ function UserDashboard({ token }) {
   return (
     <div className="dashboard">
       <h2>Stores</h2>
+      
+      <section className="owner-request-section">
+        {ownerRequestStatus?.status === 'pending' && (
+          <div className="info-box">
+            <p>⏳ Your owner request is pending review by an administrator.</p>
+          </div>
+        )}
+        {ownerRequestStatus?.status === 'approved' && (
+          <div className="success-box">
+            <p>✅ Your owner request has been approved! Please refresh to see your owner dashboard.</p>
+          </div>
+        )}
+        {ownerRequestStatus?.status === 'rejected' && (
+          <div className="error-box">
+            <p>❌ Your owner request was rejected. Reason: {ownerRequestStatus.reason}</p>
+          </div>
+        )}
+        {!ownerRequestStatus && (
+          <button onClick={() => setShowOwnerModal(true)} className="btn-owner-request">
+            Upgrade to Store Owner
+          </button>
+        )}
+      </section>
+
+      {showOwnerModal && (
+        <OwnerRequestModal
+          token={token}
+          onClose={() => setShowOwnerModal(false)}
+          onSuccess={() => {
+            setShowOwnerModal(false);
+            loadOwnerRequestStatus();
+          }}
+        />
+      )}
+
       <div className="filters">
         <input
           placeholder="Search name"
@@ -845,6 +994,153 @@ function OwnerDashboard({ token }) {
           </table>
         </section>
       )}
+    </div>
+  );
+}
+
+function ChangePasswordModal({ token, onClose }) {
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+
+    if (!oldPassword || !newPassword || !confirmPassword) {
+      setError('All fields are required');
+      return;
+    }
+
+    if (newPassword !== confirmPassword) {
+      setError('New passwords do not match');
+      return;
+    }
+
+    if (!passwordRegex.test(newPassword)) {
+      setError('Password must be 8-16 chars, include an uppercase and a special character.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/auth/change-password`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ oldPassword, newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to change password');
+      setSuccess('Password changed successfully!');
+      setTimeout(onClose, 2000);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Change Password</h2>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <form onSubmit={handleSubmit} className="form">
+          <label>
+            Current Password
+            <input
+              type="password"
+              value={oldPassword}
+              onChange={(e) => setOldPassword(e.target.value)}
+              required
+            />
+          </label>
+          <label>
+            New Password
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              required
+            />
+          </label>
+          <label>
+            Confirm New Password
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              required
+            />
+          </label>
+          {error && <div className="error">{error}</div>}
+          {success && <div className="success">{success}</div>}
+          <div className="form-buttons">
+            <button type="submit" disabled={loading}>
+              {loading ? 'Changing...' : 'Change Password'}
+            </button>
+            <button type="button" onClick={onClose} className="btn-secondary">
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function OwnerRequestModal({ token, onClose, onSuccess }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleRequest = async () => {
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/user/request-owner`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to submit request');
+      onSuccess();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Become a Store Owner</h2>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <p>Request to upgrade your account to a Store Owner?</p>
+          <p>Your request will be reviewed by an administrator.</p>
+          {error && <div className="error">{error}</div>}
+          <div className="form-buttons">
+            <button onClick={handleRequest} disabled={loading}>
+              {loading ? 'Submitting...' : 'Submit Request'}
+            </button>
+            <button onClick={onClose} className="btn-secondary">
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
